@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { browserLocalPersistence, onAuthStateChanged, setPersistence, signOut, type User } from 'firebase/auth';
-	import { doc, onSnapshot, setDoc } from 'firebase/firestore';
+	import { collection, deleteDoc, doc, getDoc, onSnapshot, setDoc } from 'firebase/firestore';
 	import { auth, db, firebaseConfigured } from '#lib/firebase.js';
 	import AuthModal from '#lib/components/AuthModal.svelte';
 	import UserMenu from '#lib/components/UserMenu.svelte';
@@ -12,18 +12,10 @@
 	type Plan = Record<string, Partial<Record<Meal, Recipe>>>;
 	const days = ['Lun', 'Mar', 'Mié', 'Jue', 'Vie', 'Sáb', 'Dom'];
 	const meals: Meal[] = ['Desayuno', 'Comida', 'Cena'];
-	const initialRecipes: Recipe[] = [
-		{ id: 'tacos', name: 'Tacos de frijol', emoji: '🌮', time: '20 min', tags: ['Rápido', 'Vegetariano'], ingredients: ['Tortillas', 'Frijoles', 'Aguacate', 'Queso fresco'], steps: ['Calienta los frijoles con una pizca de sal.', 'Dora las tortillas en un comal.', 'Sirve los frijoles sobre las tortillas y termina con aguacate y queso fresco.'] },
-		{ id: 'pasta', name: 'Pasta cremosa', emoji: '🍝', time: '25 min', tags: ['Reconfortante'], ingredients: ['Pasta', 'Crema', 'Espinaca', 'Parmesano'], steps: ['Cuece la pasta hasta que quede al dente.', 'Saltea la espinaca y agrega la crema.', 'Incorpora la pasta, el parmesano y mezcla hasta que la salsa cubra todo.'] },
-		{ id: 'bowl', name: 'Bowl mediterráneo', emoji: '🥗', time: '15 min', tags: ['Ligero', 'Vegetariano'], ingredients: ['Garbanzo', 'Pepino', 'Jitomate', 'Limón'], steps: ['Corta el pepino y el jitomate.', 'Mezcla con los garbanzos.', 'Aliña con limón, aceite de oliva y sal.'] },
-		{ id: 'salmon', name: 'Salmón al horno', emoji: '🐟', time: '30 min', tags: ['Proteína'], ingredients: ['Salmón', 'Papas', 'Brócoli', 'Limón'], steps: ['Hornea las papas con aceite y sal.', 'Agrega el salmón y el brócoli.', 'Termina con limón cuando el salmón esté cocido.'] },
-		{ id: 'toast', name: 'Tostada de aguacate', emoji: '🥑', time: '10 min', tags: ['Rápido'], ingredients: ['Pan integral', 'Aguacate', 'Huevo', 'Chile seco'], steps: ['Tuesta el pan.', 'Machaca el aguacate con sal y limón.', 'Cubre el pan y agrega el huevo y chile seco.'] },
-		{ id: 'sopa', name: 'Sopa de lentejas', emoji: '🍲', time: '40 min', tags: ['Para guardar', 'Vegetariano'], ingredients: ['Lentejas', 'Zanahoria', 'Apio', 'Jitomate'], steps: ['Sofríe zanahoria, apio y jitomate.', 'Agrega las lentejas y agua.', 'Cocina hasta que las lentejas estén suaves.'] }
-	];
-	let recipes = $state<Recipe[]>(initialRecipes);
+	let recipes = $state<Recipe[]>([]);
 	let user = $state<User | null>(null);
 	let isAuthLoading = $state(firebaseConfigured);
-	let plan = $state<Plan>({ Lun: { Desayuno: initialRecipes[4], Comida: initialRecipes[0] }, Mar: { Cena: initialRecipes[1] }, Mié: { Comida: initialRecipes[2] } });
+	let plan = $state<Plan>({});
 	let selectedDay = $state('Lun'); let activeView = $state<View>('plan');
 	let weekOffset = $state(0);
 	let isRecipeFormOpen = $state(false);
@@ -87,16 +79,48 @@
 			isAuthLoading = false;
 			return;
 		}
-		// Persistencia explícita: sigue conectado aun después de recargar o reabrir el navegador.
+		let unsubscribePlan: (() => void) | undefined;
+		let unsubscribeRecipes: (() => void) | undefined;
+		let connectionVersion = 0;
+
+		async function connectUserData(nextUser: User | null) {
+			const currentVersion = ++connectionVersion;
+			unsubscribePlan?.();
+			unsubscribeRecipes?.();
+			plan = {};
+			recipes = [];
+			if (!nextUser || !db) return;
+
+			const firestore = db;
+			const planRef = doc(firestore, 'users', nextUser.uid, 'mealPlans', 'current');
+			const migrationRef = doc(firestore, 'users', nextUser.uid, 'migrations', 'real-data-v1');
+			const migration = await getDoc(migrationRef);
+			if (!migration.exists()) {
+				await deleteDoc(planRef);
+				await setDoc(migrationRef, { planClearedAt: new Date().toISOString() });
+			}
+			if (currentVersion !== connectionVersion) return;
+
+			unsubscribePlan = onSnapshot(planRef, (snapshot) => {
+				plan = (snapshot.data()?.plan as Plan | undefined) ?? {};
+			});
+			unsubscribeRecipes = onSnapshot(collection(firestore, 'users', nextUser.uid, 'recipes'), (snapshot) => {
+				recipes = snapshot.docs.map((recipe) => recipe.data() as Recipe).sort((a, b) => a.name.localeCompare(b.name));
+			});
+		}
+
 		void setPersistence(auth, browserLocalPersistence);
 		const unsubscribeAuth = onAuthStateChanged(auth, (nextUser) => {
 			user = nextUser;
 			isAuthLoading = false;
-			if (!nextUser || !db) return;
-			const firestore = db;
-			onSnapshot(doc(firestore, 'users', nextUser.uid, 'mealPlans', 'current'), (snapshot) => { const saved = snapshot.data()?.plan as Plan | undefined; if (saved) plan = saved; });
+			void connectUserData(nextUser);
 		});
-		return unsubscribeAuth;
+		return () => {
+			connectionVersion += 1;
+			unsubscribePlan?.();
+			unsubscribeRecipes?.();
+			unsubscribeAuth();
+		};
 	});
 	async function savePlan(nextPlan: Plan) { plan = nextPlan; if (user && db) await setDoc(doc(db, 'users', user.uid, 'mealPlans', 'current'), { plan: nextPlan, updatedAt: new Date().toISOString() }); }
 	function addMeal(recipe: Recipe, meal: Meal = 'Comida') { void savePlan({ ...plan, [selectedDay]: { ...plan[selectedDay], [meal]: recipe } }); activeView = 'plan'; }
@@ -181,7 +205,7 @@
 		collapsedShoppingGroups = nextGroups;
 	}
 	function handleKeydown(event: KeyboardEvent) { if (event.key !== 'Escape') return; if (selectedRecipe) closeRecipeDetail(); else if (isRecipeFormOpen) closeRecipeForm(); }
-	function createRecipe() {
+	async function createRecipe() {
 		const name = recipeName.trim();
 		const ingredients = recipeIngredients.split(/[\n,]/).map((item) => item.trim()).filter(Boolean);
 		const steps = recipeSteps.split('\n').map((item) => item.trim()).filter(Boolean);
@@ -190,8 +214,17 @@
 			recipeFormError = 'Completa nombre, tiempo, porciones, ingredientes y preparación antes de guardar.';
 			return;
 		}
-		recipes = [...recipes, { id: `recipe-${Date.now()}`, name, emoji: recipeEmoji.trim() || '🍽️', time: `${Math.max(1, recipeTime)} min`, tags: tags.length ? tags : ['Mi receta'], ingredients, steps, servings: Math.max(1, recipeServings), notes: recipeNotes.trim() }];
-		recipeName = ''; recipeEmoji = '🍽️'; recipeTime = 30; recipeServings = 2; recipeTags = ''; recipeIngredients = ''; recipeSteps = ''; recipeNotes = ''; recipeFormError = ''; closeRecipeForm();
+		if (!user || !db) {
+			recipeFormError = 'Inicia sesión para guardar recetas.';
+			return;
+		}
+		const recipeRef = doc(collection(db, 'users', user.uid, 'recipes'));
+		try {
+			await setDoc(recipeRef, { id: recipeRef.id, name, emoji: recipeEmoji.trim() || '🍽️', time: `${Math.max(1, recipeTime)} min`, tags: tags.length ? tags : ['Mi receta'], ingredients, steps, servings: Math.max(1, recipeServings), notes: recipeNotes.trim() });
+			recipeName = ''; recipeEmoji = '🍽️'; recipeTime = 30; recipeServings = 2; recipeTags = ''; recipeIngredients = ''; recipeSteps = ''; recipeNotes = ''; recipeFormError = ''; closeRecipeForm();
+		} catch {
+			recipeFormError = 'No pudimos guardar la receta. Revisa tu conexión e inténtalo de nuevo.';
+		}
 	}
 </script>
 
@@ -209,7 +242,7 @@
 	{#if activeView === 'plan'}
 		<section class="week"><div class="week-heading"><div><h2 class="week-title">Semana del {weekLabel}</h2><div class="week-controls"><button onclick={() => weekOffset -= 1} aria-label="Semana anterior">←</button><button onclick={() => weekOffset = 0}>Hoy</button><button onclick={() => weekOffset += 1} aria-label="Semana siguiente">→</button></div></div><button class="outline" onclick={() => { activeView = 'recipes'; openRecipeForm(); }}>+ Nueva receta</button></div><div class="day-tabs">{#each weekDates as day, index}<button class:today={weekOffset === 0 && index === ((new Date().getDay() + 6) % 7)} class:selected={selectedDay === day.label} onclick={() => selectedDay = day.label}><b>{day.label}</b><span>{day.date.getDate()}</span></button>{/each}</div><div class="schedule">{#each meals as meal}{@const recipe = plan[selectedDay]?.[meal]}<div class="meal-row"><div class="meal-name">{meal}</div>{#if recipe}<article class="meal-card"><span class="food">{recipe.emoji}</span><div><b>{recipe.name}</b><small>{recipe.time} · {recipe.tags[0]}</small></div><button class="remove" onclick={() => removeMeal(selectedDay, meal)} aria-label={`Eliminar ${recipe.name}`}>×</button></article>{:else}<button class="empty-meal" onclick={() => activeView = 'recipes'}>+ Elige una receta</button>{/if}</div>{/each}</div></section>
 	{:else if activeView === 'recipes'}
-		<section class="recipes"><div class="week-heading"><div><h2>Mis recetas</h2><p class="recipe-context">Se añadirá al día <b>{selectedDay}</b>.</p></div><button class="outline" onclick={openRecipeForm}>+ Crear receta</button></div><div class="recipe-grid">{#each recipes as recipe}<article class="recipe"><span>{recipe.emoji}</span><div><h3>{recipe.name}</h3><p>{recipe.time}{recipe.servings ? ` · ${recipe.servings} porciones` : ''} · {recipe.tags.join(' · ')}</p><div class="chips">{#each recipe.ingredients.slice(0, 3) as ingredient}<i>{ingredient}</i>{/each}</div></div><footer class="recipe-actions"><button class="recipe-detail" onclick={() => openRecipeDetail(recipe)}>Ver detalle</button><button onclick={() => addMeal(recipe)}>Añadir</button></footer></article>{/each}</div></section>
+		<section class="recipes"><div class="week-heading"><div><h2>Mis recetas</h2><p class="recipe-context">Se añadirá al día <b>{selectedDay}</b>.</p></div><button class="outline" onclick={openRecipeForm}>+ Crear receta</button></div>{#if recipes.length}<div class="recipe-grid">{#each recipes as recipe}<article class="recipe"><span>{recipe.emoji}</span><div><h3>{recipe.name}</h3><p>{recipe.time}{recipe.servings ? ` · ${recipe.servings} porciones` : ''} · {recipe.tags.join(' · ')}</p><div class="chips">{#each recipe.ingredients.slice(0, 3) as ingredient}<i>{ingredient}</i>{/each}</div></div><footer class="recipe-actions"><button class="recipe-detail" onclick={() => openRecipeDetail(recipe)}>Ver detalle</button><button onclick={() => addMeal(recipe)}>Añadir</button></footer></article>{/each}</div>{:else}<div class="shopping-empty"><b>Todavía no tienes recetas.</b><p>Crea tu primera receta para empezar a armar tu semana.</p></div>{/if}</section>
 	{:else if activeView === 'shopping'}
 		<section class="shopping">
 			<div class="shopping-heading"><div><h2>Lista de compras</h2><p class="subtitle">Elige las comidas que quieres resolver ahora.</p></div>{#if shoppingList.length}<button class="shopping-all" onclick={toggleAllShoppingItems}>{checkedShoppingCount === shoppingList.length ? 'Reiniciar lista' : 'Marcar todo'}</button>{/if}</div>
@@ -232,7 +265,7 @@
 		<dialog class="recipe-sheet" class:dragging={isRecipeSheetDragging} class:closing={isRecipeSheetClosing} style={`--sheet-offset: ${recipeSheetOffset}px`} open aria-modal="true" aria-labelledby="recipe-form-title">
 			<button class="sheet-handle" type="button" onpointerdown={startRecipeSheetDrag} onclick={clickRecipeSheetHandle} aria-label="Arrastra hacia abajo para cerrar"></button>
 			<div class="sheet-heading"><div><h2 id="recipe-form-title">Nueva receta</h2><p>Guarda los detalles para tenerla lista al planear.</p></div><button class="sheet-close" type="button" onclick={closeRecipeForm} aria-label="Cerrar formulario">×</button></div>
-			<form class="recipe-form" oninput={() => (recipeFormError = '')} onsubmit={(event) => { event.preventDefault(); createRecipe(); }}>
+			<form class="recipe-form" oninput={() => (recipeFormError = '')} onsubmit={(event) => { event.preventDefault(); void createRecipe(); }}>
 				<div class="recipe-form-grid">
 					<label class="field-full">Nombre de la receta<input bind:value={recipeName} required placeholder="Ej. Chilaquiles verdes" /></label>
 					<label>Emoji<input class="emoji-input" bind:value={recipeEmoji} maxlength="4" aria-label="Emoji de la receta" /></label>
